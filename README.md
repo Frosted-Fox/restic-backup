@@ -19,7 +19,9 @@ dashboard; and runs a persistent scheduler under systemd. The default source is
 - A local process lock prevents two instances on this node from backing up at
   once. On recognized Restic lock errors, the app invokes ordinary `restic
   unlock` to clear only locks Restic confirms are stale, then retries with
-  Restic's bounded 30-minute `--retry-lock` wait for an active operation to
+  Restic's bounded 30-second `--retry-lock` wait, repeating safe stale-lock
+  checks for up to 30 minutes. This lets locks left by a reboot be cleared as
+  soon as Restic identifies them as stale, while allowing active operations to
   finish. It never uses `--remove-all`, so an active operation on another
   machine is not forcibly unlocked.
 - Retain the latest configured number of this app's snapshots (tagged and

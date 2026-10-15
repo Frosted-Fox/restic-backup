@@ -736,13 +736,39 @@ class ResticCommandTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         retry_command = run.call_args.args[0]
         self.assertIn("--retry-lock", retry_command)
-        self.assertIn(app.LOCK_RETRY_DURATION, retry_command)
+        self.assertIn(app.LOCK_RETRY_INTERVAL, retry_command)
 
     def test_restic_command_adds_optional_lock_retry_duration(self):
         config = app.Config(repository="/tmp/repo", password="test-password")
         self.assertEqual(
-            app._restic_command(config, ["forget", "--prune"], retry_lock="30m"),
-            ["restic", "--retry-lock", "30m", "forget", "--prune"],
+            app._restic_command(config, ["forget", "--prune"], retry_lock="30s"),
+            ["restic", "--retry-lock", "30s", "forget", "--prune"],
+        )
+
+    def test_stale_repository_lock_is_rechecked_until_it_clears(self):
+        config = app.Config(repository="/tmp/repo")
+        with patch.object(app, "LOCK_RETRY_ATTEMPTS", 3), \
+             patch.object(
+                 app.subprocess,
+                 "Popen",
+                 side_effect=[
+                     self._fake_process(1, "Fatal: repository is already locked"),
+                     self._fake_process(1, "Fatal: repository is already locked"),
+                     self._fake_process(1, "Fatal: repository is already locked"),
+                     self._fake_process(0, "operation completed"),
+                 ],
+             ) as run, \
+             patch.object(app, "_unlock", return_value=False) as unlock:
+            result = app._run_restic(config, ["forget", "--prune"], app.logging.getLogger("test"))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(unlock.call_count, 3)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "restic", "--insecure-no-password", "--retry-lock",
+                app.LOCK_RETRY_INTERVAL, "forget", "--prune",
+            ],
         )
 
     def test_backup_waits_for_active_repository_lock_after_safe_unlock_attempt(self):
@@ -760,7 +786,7 @@ class ResticCommandTests(unittest.TestCase):
         self.assertEqual(run.call_count, 2)
         retry_command = run.call_args.args[0]
         self.assertIn("--retry-lock", retry_command)
-        self.assertIn(app.LOCK_RETRY_DURATION, retry_command)
+        self.assertIn(app.LOCK_RETRY_INTERVAL, retry_command)
         self.assertIn("backup", retry_command)
 
     def test_restic_command_can_be_cancelled(self):

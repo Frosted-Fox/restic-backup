@@ -45,6 +45,8 @@ LOCK_ERRORS = (
     "unable to create lock",
     "stale lock",
 )
+LOCK_RETRY_INTERVAL = "30s"
+LOCK_RETRY_ATTEMPTS = 60
 LOCK_RETRY_DURATION = "30m"
 MISSING_REPOSITORY_ERRORS = (
     "config file does not exist",
@@ -378,11 +380,12 @@ def _run_restic(
     lock_retry: bool = True,
     control: TaskControl | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    for attempt in range(2 if lock_retry else 1):
+    max_attempts = LOCK_RETRY_ATTEMPTS + 1 if lock_retry else 1
+    for attempt in range(max_attempts):
         command = _restic_command(
             config,
             arguments,
-            retry_lock=LOCK_RETRY_DURATION if attempt else None,
+            retry_lock=LOCK_RETRY_INTERVAL if attempt else None,
         )
         if control is not None:
             control.check_cancelled()
@@ -422,7 +425,7 @@ def _run_restic(
             return subprocess.CompletedProcess(command, return_code, output)
         if control is not None:
             control.check_cancelled()
-        if attempt == 0 and any(marker in output.lower() for marker in LOCK_ERRORS):
+        if attempt + 1 < max_attempts and any(marker in output.lower() for marker in LOCK_ERRORS):
             if _unlock(config, logger):
                 logger.info("Stale repository lock removed safely; retrying Restic.")
             else:
@@ -449,11 +452,11 @@ def _stream_backup(
         "--host", BACKUP_HOST,
         config.source,
     ]
-    for attempt in range(2):
+    for attempt in range(LOCK_RETRY_ATTEMPTS + 1):
         command = _restic_command(
             config,
             arguments,
-            retry_lock=LOCK_RETRY_DURATION if attempt else None,
+            retry_lock=LOCK_RETRY_INTERVAL if attempt else None,
         )
         try:
             process = subprocess.Popen(
@@ -495,7 +498,9 @@ def _stream_backup(
         if control is not None:
             control.check_cancelled()
         output = "\n".join(lines)
-        if attempt == 0 and any(marker in output.lower() for marker in LOCK_ERRORS):
+        if attempt + 1 < LOCK_RETRY_ATTEMPTS + 1 and any(
+            marker in output.lower() for marker in LOCK_ERRORS
+        ):
             if _unlock(config, logger):
                 logger.info("Stale repository lock removed safely; retrying backup.")
             else:
