@@ -1729,7 +1729,7 @@ def _localized_log_line(line: str, timezone_name: str) -> str:
     return f"{local_timestamp.strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} {local_timestamp.tzname()}{match.group(2)}"
 
 
-WATERMARK = "Made by rybernt.cloud | Frosted_Fox"
+WATERMARK = "Made by Ariyan Kumar | Rybernt"
 
 
 def _ui_put(screen: Any, row: int, column: int, text: str, width: int, attr: int = 0) -> None:

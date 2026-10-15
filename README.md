@@ -110,7 +110,7 @@ The installer adds the `rybernt` command to `/usr/local/bin`. You can also run
 `rybernt tui` to open the same dashboard.
 
 The dashboard uses a compact, boxed status/actions/activity layout and carries
-the footer watermark “Made by rybernt.cloud | Frosted_Fox”.
+the footer watermark “Made by Ariyan Kumar | Rybernt”.
 
 Keyboard controls: `r` run a backup, `s` browse all snapshots and inspect
 details, `x` select a snapshot and restore it after confirming a separate
