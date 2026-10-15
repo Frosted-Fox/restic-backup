@@ -465,7 +465,8 @@ class ResticCommandTests(unittest.TestCase):
             source = Path(directory) / "source"
             source.mkdir()
             config = app.Config(source=str(source), repository="/tmp/repo")
-            self.assertEqual(app._validate_restore_target("/", config), Path("/"))
+            with patch.object(app.os, "access", return_value=True):
+                self.assertEqual(app._validate_restore_target("/", config), Path("/"))
 
     def test_restore_target_prompt_reports_bad_path_then_retries(self):
         class FakeScreen:
