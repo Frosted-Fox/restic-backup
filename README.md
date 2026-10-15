@@ -28,21 +28,23 @@ dashboard; and runs a persistent scheduler under systemd. The default source is
 
 ## Install and configure
 
-On each supported Linux server with systemd, add an SSH key with read access to
-this private GitHub repository, then run this single command to download the
-latest source and start the interactive installer:
+On a supported Linux server with systemd, run this single command as an
+administrator to download the latest version and start the interactive
+installer. No GitHub account or SSH key is required:
 
 ```sh
-git clone --depth 1 git@github.com:Frosted-Fox/restic-backup.git restic-backup && cd restic-backup && sudo ./install.sh
+curl -fsSL https://raw.githubusercontent.com/Frosted-Fox/restic-backup/main/install-remote.sh | sudo sh
 ```
 
 If you prefer to download or install manually:
 
 ```sh
-git clone --depth 1 git@github.com:Frosted-Fox/restic-backup.git
+git clone --depth 1 https://github.com/Frosted-Fox/restic-backup.git
 cd restic-backup
 sudo ./install.sh
 ```
+
+The one-command bootstrap requires `curl`, `tar`, and an interactive terminal.
 
 The installer installs Python and Restic using the system package manager when
 needed, prompts for the S3
