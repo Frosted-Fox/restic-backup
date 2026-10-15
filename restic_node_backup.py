@@ -45,6 +45,7 @@ LOCK_ERRORS = (
     "unable to create lock",
     "stale lock",
 )
+LOCK_RETRY_DURATION = "30m"
 MISSING_REPOSITORY_ERRORS = (
     "config file does not exist",
     "repository does not exist",
@@ -377,8 +378,12 @@ def _run_restic(
     lock_retry: bool = True,
     control: TaskControl | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    command = _restic_command(config, arguments)
     for attempt in range(2 if lock_retry else 1):
+        command = _restic_command(
+            config,
+            arguments,
+            retry_lock=LOCK_RETRY_DURATION if attempt else None,
+        )
         if control is not None:
             control.check_cancelled()
         try:
@@ -419,8 +424,14 @@ def _run_restic(
             control.check_cancelled()
         if attempt == 0 and any(marker in output.lower() for marker in LOCK_ERRORS):
             if _unlock(config, logger):
-                logger.info("Retrying Restic after safe stale-lock cleanup.")
-                continue
+                logger.info("Stale repository lock removed safely; retrying Restic.")
+            else:
+                logger.warning(
+                    "Repository lock is still active or could not be confirmed stale; "
+                    "retrying Restic and waiting up to %s for it to clear.",
+                    LOCK_RETRY_DURATION,
+                )
+            continue
         safe_output = _redact(output, config).strip()
         detail = safe_output[-4000:] if safe_output else "No diagnostic output."
         raise AppError(f"Restic {' '.join(arguments[:2])} failed (exit {return_code}):\n{detail}")
@@ -432,13 +443,18 @@ def _stream_backup(
     logger: logging.Logger,
     control: TaskControl | None = None,
 ) -> None:
-    command = _restic_command(config, [
+    arguments = [
         "backup", "--json",
         "--tag", BACKUP_TAG,
         "--host", BACKUP_HOST,
         config.source,
-    ])
+    ]
     for attempt in range(2):
+        command = _restic_command(
+            config,
+            arguments,
+            retry_lock=LOCK_RETRY_DURATION if attempt else None,
+        )
         try:
             process = subprocess.Popen(
                 command,
@@ -481,8 +497,14 @@ def _stream_backup(
         output = "\n".join(lines)
         if attempt == 0 and any(marker in output.lower() for marker in LOCK_ERRORS):
             if _unlock(config, logger):
-                logger.info("Retrying backup after safe stale-lock cleanup.")
-                continue
+                logger.info("Stale repository lock removed safely; retrying backup.")
+            else:
+                logger.warning(
+                    "Repository lock is still active or could not be confirmed stale; "
+                    "retrying backup and waiting up to %s for it to clear.",
+                    LOCK_RETRY_DURATION,
+                )
+            continue
         detail = output[-4000:] if output else "No diagnostic output."
         raise AppError(f"Restic backup failed (exit {return_code}):\n{detail}")
     raise AppError("Restic backup retry ended unexpectedly.")
@@ -767,10 +789,17 @@ def restic_snapshots(control: TaskControl | None = None) -> list[dict[str, Any]]
     return snapshots
 
 
-def _restic_command(config: Config, arguments: list[str]) -> list[str]:
+def _restic_command(
+    config: Config,
+    arguments: list[str],
+    *,
+    retry_lock: str | None = None,
+) -> list[str]:
     command = [config.restic_binary]
     if not config.password:
         command.append("--insecure-no-password")
+    if retry_lock is not None:
+        command.extend(["--retry-lock", retry_lock])
     command.extend(arguments)
     return command
 

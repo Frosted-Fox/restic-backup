@@ -18,9 +18,10 @@ dashboard; and runs a persistent scheduler under systemd. The default source is
   downtime, and exponential retry (1 minute up to 1 hour) after failures.
 - A local process lock prevents two instances on this node from backing up at
   once. On recognized Restic lock errors, the app invokes ordinary `restic
-  unlock` and retries once. It never uses `--remove-all`: Restic must confirm
-  that locks are stale, so an active operation on another node is not forcibly
-  unlocked.
+  unlock` to clear only locks Restic confirms are stale, then retries with
+  Restic's bounded 30-minute `--retry-lock` wait for an active operation to
+  finish. It never uses `--remove-all`, so an active operation on another
+  machine is not forcibly unlocked.
 - Retain the latest configured number of this app's snapshots (tagged and
   host-scoped) and prune unused repository data after a successful backup.
 - Snapshot listing, repository verification, and restore to a separate path.

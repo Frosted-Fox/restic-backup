@@ -718,17 +718,49 @@ class ResticCommandTests(unittest.TestCase):
             self.assertEqual(state["status"], "success")
             self.assertIsNotNone(state["last_success"])
 
-    def test_active_repository_lock_is_not_retried_when_unlock_fails(self):
+    def test_active_repository_lock_retries_with_bounded_wait_when_unlock_fails(self):
         config = app.Config(repository="/tmp/repo", password="pw")
         with patch.object(
             app.subprocess,
             "Popen",
-            return_value=self._fake_process(1, "Fatal: repository is already locked"),
+            side_effect=[
+                self._fake_process(1, "Fatal: repository is already locked"),
+                self._fake_process(0, "operation completed"),
+            ],
         ) as run, \
              patch.object(app, "_unlock", return_value=False):
-            with self.assertRaises(app.AppError):
-                app._run_restic(config, ["snapshots"], app.logging.getLogger("test"))
-        run.assert_called_once()
+            result = app._run_restic(config, ["snapshots"], app.logging.getLogger("test"))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "operation completed")
+        self.assertEqual(run.call_count, 2)
+        retry_command = run.call_args.args[0]
+        self.assertIn("--retry-lock", retry_command)
+        self.assertIn(app.LOCK_RETRY_DURATION, retry_command)
+
+    def test_restic_command_adds_optional_lock_retry_duration(self):
+        config = app.Config(repository="/tmp/repo", password="test-password")
+        self.assertEqual(
+            app._restic_command(config, ["forget", "--prune"], retry_lock="30m"),
+            ["restic", "--retry-lock", "30m", "forget", "--prune"],
+        )
+
+    def test_backup_waits_for_active_repository_lock_after_safe_unlock_attempt(self):
+        config = app.Config(source="/tmp/source", repository="/tmp/repo")
+        with patch.object(
+            app.subprocess,
+            "Popen",
+            side_effect=[
+                self._fake_process(1, "Fatal: repository is already locked"),
+                self._fake_process(0, '{"message_type":"summary"}'),
+            ],
+        ) as run, \
+             patch.object(app, "_unlock", return_value=False):
+            app._stream_backup(config, app.logging.getLogger("test"))
+        self.assertEqual(run.call_count, 2)
+        retry_command = run.call_args.args[0]
+        self.assertIn("--retry-lock", retry_command)
+        self.assertIn(app.LOCK_RETRY_DURATION, retry_command)
+        self.assertIn("backup", retry_command)
 
     def test_restic_command_can_be_cancelled(self):
         config = app.Config(repository="/tmp/repo", password="pw")
