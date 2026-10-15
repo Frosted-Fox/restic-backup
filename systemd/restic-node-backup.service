@@ -1,0 +1,27 @@
+[Unit]
+Description=Restic game-node backup scheduler
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/restic-node-backup
+ExecStart=/usr/bin/python3 /opt/restic-node-backup/restic_node_backup.py daemon
+Restart=on-failure
+RestartSec=15s
+StateDirectory=restic-node-backup
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

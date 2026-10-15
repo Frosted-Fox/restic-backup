@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ ! -x /usr/bin/python3 ] || [ ! -f /opt/restic-node-backup/restic_node_backup.py ]; then
+    echo "Restic Node Backup is not installed. Run the project's install.sh first." >&2
+    exit 1
+fi
+
+exec /usr/bin/python3 /opt/restic-node-backup/restic_node_backup.py "$@"
