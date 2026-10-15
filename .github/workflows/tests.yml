@@ -19,6 +19,5 @@ jobs:
         run: |
           python -m py_compile restic_node_backup.py
           sh -n install.sh
-          sh -n install-remote.sh
       - name: Run tests
         run: python -m unittest discover -s tests -v
