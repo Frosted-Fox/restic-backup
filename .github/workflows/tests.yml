@@ -10,9 +10,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    env:
-      RNB_STATE_DIR: ${{ runner.temp }}/restic-node-backup-state
-      RNB_CONFIG: ${{ runner.temp }}/restic-node-backup-config/config.json
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,4 +21,7 @@ jobs:
           sh -n install.sh
           sh -n install-remote.sh
       - name: Run tests
+        env:
+          RNB_STATE_DIR: ${{ runner.temp }}/restic-node-backup-state
+          RNB_CONFIG: ${{ runner.temp }}/restic-node-backup-config/config.json
         run: python -m unittest discover -s tests -v
