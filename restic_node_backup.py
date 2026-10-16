@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -48,6 +49,7 @@ LOCK_ERRORS = (
 LOCK_RETRY_INTERVAL = "30s"
 LOCK_RETRY_ATTEMPTS = 60
 LOCK_RETRY_DURATION = "30m"
+STORAGE_REFRESH_SECONDS = 1800
 MISSING_REPOSITORY_ERRORS = (
     "config file does not exist",
     "repository does not exist",
@@ -618,6 +620,56 @@ def _backup_lock() -> Any:
     return stream
 
 
+def _start_manual_backup() -> str:
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        raise AppError("systemd-run is required to start a backup that survives closing the dashboard.")
+    script_path = Path(__file__).resolve()
+    unit_name = f"restic-node-backup-manual-{os.getpid()}-{int(time.time())}"
+    command = [
+        systemd_run,
+        "--system",
+        "--no-block",
+        "--collect",
+        f"--unit={unit_name}",
+        "--property=Type=exec",
+        "--property=User=root",
+        "--property=Group=root",
+        "--property=StateDirectory=restic-node-backup",
+        "--property=StateDirectoryMode=0700",
+        "--property=UMask=0077",
+        "--property=NoNewPrivileges=true",
+        "--property=PrivateTmp=true",
+        "--property=ProtectSystem=full",
+        "--property=ProtectHome=read-only",
+        "--property=ProtectKernelTunables=true",
+        "--property=ProtectKernelModules=true",
+        "--property=ProtectControlGroups=true",
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        f"--property=WorkingDirectory={script_path.parent}",
+        sys.executable,
+        str(script_path),
+        "run-now",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError as exc:
+        raise AppError(f"Could not start the persistent backup service: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stdout or "").strip()
+        raise AppError(
+            "Could not start the persistent backup service"
+            + (f":\n{detail[-2000:]}" if detail else f" (exit {result.returncode}).")
+        )
+    return f"Backup started as {unit_name}; it will continue if you close the dashboard."
+
+
 def run_backup(control: TaskControl | None = None) -> bool:
     logger = create_logger()
     config = load_config()
@@ -960,6 +1012,105 @@ def _s3_defaults(repository: str) -> tuple[str, str]:
     if parsed.scheme and endpoint:
         endpoint = f"{parsed.scheme}://{endpoint}"
     return endpoint, bucket
+
+
+def s3_repository_storage_bytes(config: Config) -> int:
+    if not config.repository.startswith("s3:"):
+        raise AppError("Automatic storage usage is supported for S3 repositories only.")
+    parsed = urlsplit(config.repository[len("s3:"):])
+    parts = parsed.path.strip("/").split("/", 1)
+    if not parsed.scheme or not parsed.netloc or not parts[0]:
+        raise AppError("Cannot determine the S3 endpoint and bucket from the repository URL.")
+    bucket = parts[0]
+    prefix = parts[1].strip("/") + "/" if len(parts) > 1 and parts[1].strip("/") else ""
+    endpoint_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    try:
+        import boto3
+        from botocore.config import Config as BotoConfig
+        from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError as exc:
+        raise AppError(
+            "The boto3 package is required for automatic S3 storage usage. "
+            "Re-run the installer to install it."
+        ) from exc
+
+    try:
+        session = boto3.Session(
+            aws_access_key_id=config.access_key or None,
+            aws_secret_access_key=config.secret_key or None,
+            aws_session_token=config.session_token or None,
+            region_name=config.region or None,
+        )
+        client = session.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            config=BotoConfig(s3={"addressing_style": "path"}),
+        )
+        paginator = client.get_paginator("list_objects_v2")
+        return sum(
+            int(item["Size"])
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+            for item in page.get("Contents", [])
+        )
+    except (BotoCoreError, ClientError, KeyError, TypeError, ValueError) as exc:
+        raise AppError(f"Could not read S3 storage usage: {exc}") from exc
+
+
+def _refresh_storage_usage() -> None:
+    store = StateStore()
+    logger = create_logger()
+    config: Config | None = None
+    try:
+        config = load_config()
+        used_bytes = s3_repository_storage_bytes(config)
+    except AppError as exc:
+        try:
+            store.update(
+                storage_checked_at=iso_time(),
+                storage_repository=config.repository if config else None,
+                storage_error=str(exc),
+            )
+        except (AppError, OSError) as state_exc:
+            logger.error("Could not save S3 storage usage error state: %s", state_exc)
+        logger.warning("Could not refresh S3 storage usage: %s", exc)
+        return
+    try:
+        store.update(
+            storage_bytes=used_bytes,
+            storage_checked_at=iso_time(),
+            storage_repository=config.repository,
+            storage_error=None,
+        )
+    except (AppError, OSError) as exc:
+        logger.error("Could not save S3 storage usage state: %s", exc)
+
+
+def _maybe_refresh_storage(
+    state: dict[str, Any],
+    config: Config | None,
+    thread: threading.Thread | None,
+) -> threading.Thread | None:
+    if (
+        config is None
+        or not config.repository.startswith("s3:")
+        or (thread is not None and thread.is_alive())
+    ):
+        return thread
+    checked_at = parse_time(state.get("storage_checked_at"))
+    if (
+        state.get("storage_repository") == config.repository
+        and checked_at is not None
+        and (now_utc() - checked_at).total_seconds() < STORAGE_REFRESH_SECONDS
+    ):
+        return None
+    thread = threading.Thread(
+        target=_refresh_storage_usage,
+        name="s3-storage-refresh",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _prompt(label: str, default: str = "", *, secret: bool = False) -> str:
@@ -1491,8 +1642,7 @@ def _do_tui_action(
                 last_operation_error=None,
             )
         if action == "run":
-            success = run_backup(control)
-            result_queue.put(("message", "Backup completed." if success else "Backup failed or was cancelled; see status/log."))
+            result_queue.put(("message", _start_manual_backup()))
         elif action == "verify":
             result_queue.put(("message", verify_repository(control=control)))
         elif action in ("snapshots", "select_restore"):
@@ -1750,6 +1900,27 @@ def _gui_timestamp_text(value: Any, timezone_name: str) -> str:
     return f"{local.strftime('%Y-%m-%d %H:%M:%S')} {local.tzname() or timezone_name}"
 
 
+def _dashboard_field_lines(label: str, value: str, width: int) -> list[str]:
+    prefix = f"{label:<8}"
+    content_width = max(1, width - len(prefix))
+    wrapped = textwrap.wrap(
+        value,
+        width=content_width,
+        break_long_words=True,
+        break_on_hyphens=False,
+    ) or [""]
+    return [prefix + wrapped[0], *(" " * len(prefix) + line for line in wrapped[1:])]
+
+
+def _format_storage_size(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if size < 1024 or unit == "PiB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PiB"
+
+
 def _localized_log_line(line: str, timezone_name: str) -> str:
     match = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})(.*)$", line)
     if match is None:
@@ -1805,7 +1976,9 @@ def _tui(screen: Any) -> None:
     screen.timeout(400)
     result_queue: queue.Queue[Any] = queue.Queue()
     worker: threading.Thread | None = None
+    storage_thread: threading.Thread | None = None
     active_control: TaskControl | None = None
+    active_action: str | None = None
     notice = "Ready. The scheduler runs independently as a systemd service."
     while True:
         screen.erase()
@@ -1816,16 +1989,6 @@ def _tui(screen: Any) -> None:
             screen.refresh()
             key = screen.getch()
             if key in (ord("q"), ord("Q")):
-                if worker is not None and worker.is_alive():
-                    if active_control is not None:
-                        active_control.cancel()
-                    StateStore().update(cancel_requested=True)
-                    worker.join()
-                elif (
-                    StateStore().read().get("status") == "running"
-                    or StateStore().read().get("task_status") == "running"
-                ):
-                    StateStore().update(cancel_requested=True)
                 return
             continue
         try:
@@ -1842,6 +2005,7 @@ def _tui(screen: Any) -> None:
         except AppError as exc:
             state = {}
             state_error = str(exc)
+        storage_thread = _maybe_refresh_storage(state, config, storage_thread)
         task_running = state.get("status") == "running" or state.get("task_status") == "running"
         timezone_name = config.timezone_name if config else "UTC"
         display_timezone = ZoneInfo(timezone_name)
@@ -1853,39 +2017,74 @@ def _tui(screen: Any) -> None:
 
         status = str(state.get("status", "waiting")).upper()
         color = curses.color_pair(2) if status == "SUCCESS" else curses.color_pair(4) if status == "FAILED" else curses.color_pair(3)
-        left_width = 34
+        left_width = min(58, max(32, width // 2 - 4))
         gap = 2
         right_left = 2 + left_width + gap
         right_width = width - right_left - 2
-        panel_height = 11
-        _ui_panel(screen, 2, 2, panel_height, left_width, "NODE")
-        _ui_panel(screen, 2, right_left, panel_height, right_width, "QUICK ACTIONS")
-
         inner_width = left_width - 4
-        _ui_put(screen, 3, 4, f"● {status}", inner_width, color | curses.A_BOLD)
-        _ui_put(screen, 4, 4, f"Source  {config.source if config else DEFAULT_SOURCE}", inner_width)
-        _ui_put(screen, 5, 4, f"Repo    {config.repository if config else 'Not configured'}", inner_width)
-        _ui_put(screen, 6, 4, f"Last OK {_gui_timestamp_text(state.get('last_success'), timezone_name)}", inner_width)
         retry_at = state.get("retry_at")
         schedule_label = "Retry at" if retry_at else "Next run"
         schedule_time = _gui_timestamp_text(
             retry_at or state.get("next_run"), timezone_name
         ) if (retry_at or state.get("next_run")) else "When scheduler starts"
-        _ui_put(screen, 7, 4, f"{schedule_label:<8} {schedule_time}", inner_width)
-        task_text = (
-            f"Task    {active_control.phase if active_control else state.get('operation') or 'Idle'}"
-            if task_running or (worker is not None and worker.is_alive())
-            else "Task    Idle"
+        task_text = "Idle"
+        if task_running or (worker is not None and worker.is_alive()):
+            task_text = active_control.phase if active_control else state.get("operation") or "Running"
+        storage_error = (
+            state.get("storage_error")
+            if config is not None and state.get("storage_repository") == config.repository
+            else None
         )
-        _ui_put(screen, 8, 4, task_text, inner_width)
-        last_error = state.get("last_error") or state.get("retention_error") or "No backup errors"
-        _ui_put(screen, 9, 4, f"Info    {last_error}", inner_width, curses.color_pair(4) if state.get("last_error") else curses.A_NORMAL)
+        last_error = state.get("last_error") or state.get("retention_error") or storage_error or "No backup errors"
+        storage_bytes = state.get("storage_bytes")
+        if (
+            isinstance(storage_bytes, int)
+            and not isinstance(storage_bytes, bool)
+            and storage_bytes >= 0
+            and config is not None
+            and state.get("storage_repository") == config.repository
+        ):
+            storage_text = f"{_format_storage_size(storage_bytes)} used"
+        elif storage_error:
+            storage_text = "Unavailable (see Info)"
+        elif config and config.repository.startswith("s3:"):
+            storage_text = "Checking S3 object usage…"
+        else:
+            storage_text = "Not an S3 repository"
+        node_lines = [f"● {status}"]
+        node_lines.extend(_dashboard_field_lines("Source", config.source if config else DEFAULT_SOURCE, inner_width))
+        node_lines.extend(_dashboard_field_lines("Repo", config.repository if config else "Not configured", inner_width))
+        node_lines.extend(_dashboard_field_lines("Storage", storage_text, inner_width))
+        node_lines.extend(_dashboard_field_lines("Last OK", _gui_timestamp_text(state.get("last_success"), timezone_name), inner_width))
+        node_lines.extend(_dashboard_field_lines(schedule_label, schedule_time, inner_width))
+        node_lines.extend(_dashboard_field_lines("Task", str(task_text), inner_width))
+        node_lines.extend(_dashboard_field_lines("Info", str(last_error), inner_width))
+        panel_height = max(13, min(len(node_lines) + 2, height - 12))
+        node_lines = node_lines[:panel_height - 2]
+        _ui_panel(screen, 2, 2, panel_height, left_width, "NODE")
+        _ui_panel(screen, 2, right_left, panel_height, right_width, "QUICK ACTIONS")
+        for row, line in enumerate(node_lines, start=3):
+            _ui_put(
+                screen,
+                row,
+                4,
+                line,
+                inner_width,
+                color | curses.A_BOLD if row == 3 else (
+                    curses.color_pair(4) if line.startswith("Info") and (
+                        state.get("last_error")
+                        or state.get("retention_error")
+                        or storage_error
+                    )
+                    else curses.A_NORMAL
+                ),
+            )
         if state_error:
-            _ui_put(screen, 10, 4, f"State error: {state_error}", inner_width, curses.color_pair(4))
+            notice = f"State error: {state_error}"
         elif config_error:
-            _ui_put(screen, 10, 4, f"Config: {config_error}", inner_width, curses.color_pair(4))
+            notice = f"Config: {config_error}"
         elif state.get("retention_error"):
-            _ui_put(screen, 10, 4, f"Retention: {state['retention_error']}", inner_width, curses.color_pair(3))
+            notice = f"Retention: {state['retention_error']}"
 
         actions = [
             ("r", "Run backup"), ("v", "Verify repo"),
@@ -1902,6 +2101,7 @@ def _tui(screen: Any) -> None:
             _ui_put(screen, row, column, f"[{shortcut.upper()}] {label}", col_width - 1,
                     curses.color_pair(1) | curses.A_BOLD)
 
+        progress_y = 2 + panel_height
         progress = ""
         if worker is not None and worker.is_alive():
             local_progress = dict(active_control.progress) if active_control else {}
@@ -1919,10 +2119,10 @@ def _tui(screen: Any) -> None:
             current_files = state.get("progress", {}).get("current_files", [])
             if isinstance(current_files, list) and current_files:
                 progress += f" · {', '.join(str(path) for path in current_files[:2])}"
-        _ui_put(screen, 13, 3, f"PROGRESS  {progress or 'Idle'}", width - 6, curses.color_pair(3) if task_running else curses.A_NORMAL)
-        _ui_put(screen, 14, 2, "-" * (width - 4), width - 4, curses.color_pair(1))
+        _ui_put(screen, progress_y, 3, f"PROGRESS  {progress or 'Idle'}", width - 6, curses.color_pair(3) if task_running else curses.A_NORMAL)
+        _ui_put(screen, progress_y + 1, 2, "-" * (width - 4), width - 4, curses.color_pair(1))
 
-        activity_top = 15
+        activity_top = progress_y + 2
         activity_height = max(4, height - activity_top - 4)
         _ui_panel(screen, activity_top, 2, activity_height, width - 4, f"ACTIVITY  {LOG_PATH}")
         log_rows = max(1, activity_height - 2)
@@ -1937,17 +2137,19 @@ def _tui(screen: Any) -> None:
         screen.refresh()
         key = screen.getch()
         if key in (ord("q"), ord("Q")):
-            if (worker is not None and worker.is_alive()) or task_running:
+            if worker is not None and worker.is_alive() and active_action != "run":
                 try:
-                    confirmation = _tui_prompt(screen, "Cancel running task and quit? Type YES", "")
+                    confirmation = _tui_prompt(
+                        screen,
+                        "Cancel this dashboard task and quit? Type YES (other backups keep running)",
+                        "",
+                    )
                 except AppError:
                     continue
                 if confirmation != "YES":
                     continue
-                if worker is not None and worker.is_alive() and active_control is not None:
+                if active_control is not None:
                     active_control.cancel()
-                StateStore().update(cancel_requested=True)
-            if worker is not None and worker.is_alive():
                 worker.join()
             return
         if key in (ord("l"), ord("L")):
@@ -1956,7 +2158,8 @@ def _tui(screen: Any) -> None:
         if key in (ord("k"), ord("K")):
             if worker is not None and worker.is_alive():
                 active_control.cancel()
-                StateStore().update(cancel_requested=True)
+                if active_action == "run":
+                    StateStore().update(cancel_requested=True)
                 notice = "Cancellation requested; waiting for Restic to stop safely."
             elif task_running:
                 StateStore().update(cancel_requested=True)
@@ -2003,6 +2206,7 @@ def _tui(screen: Any) -> None:
                     continue
             notice = f"Starting {action}…"
             active_control = TaskControl()
+            active_action = action
             worker = threading.Thread(
                 target=_do_tui_action,
                 args=(action, result_queue, active_control, *action_args),
@@ -2011,6 +2215,7 @@ def _tui(screen: Any) -> None:
         try:
             result_item = result_queue.get_nowait()
             worker = None
+            active_action = None
             result_type, result = result_item[:2]
             if result_type == "snapshots":
                 action = result_item[2]
@@ -2046,6 +2251,7 @@ def _tui(screen: Any) -> None:
                         target=_do_tui_action,
                         args=("restore", result_queue, active_control, snapshot_id, str(target_path)),
                     )
+                    active_action = "restore"
                     notice = f"Restoring snapshot {snapshot_id[:12]}…"
                     worker.start()
             else:
@@ -2109,7 +2315,8 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("backup", help="open the interactive backup dashboard")
     subparsers.add_parser("configure", help="configure source, S3 credentials and schedule")
     subparsers.add_parser("daemon", help="run the persistent, retrying scheduler")
-    subparsers.add_parser("run", help="run a backup immediately")
+    subparsers.add_parser("run", help="start an immediate backup that survives terminal closure")
+    subparsers.add_parser("run-now", help=argparse.SUPPRESS)
     subparsers.add_parser("init", help="initialize a new Restic repository")
     subparsers.add_parser("ensure-repo", help="initialize the repository only if it is new")
     subparsers.add_parser("snapshots", help="list snapshots as JSON")
@@ -2130,6 +2337,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "daemon":
             run_scheduler()
         elif args.command == "run":
+            print(_start_manual_backup())
+        elif args.command == "run-now":
             return 0 if run_backup() else 1
         elif args.command == "init":
             print(initialize_repository())

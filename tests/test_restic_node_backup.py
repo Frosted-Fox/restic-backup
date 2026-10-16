@@ -3,9 +3,11 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import restic_node_backup as app
 
@@ -235,12 +237,19 @@ class ConfigurationTests(unittest.TestCase):
                 return ord("q")
 
         screen = FakeScreen()
-        config = app.Config(repository="s3:https://s3.example.net/backups")
+        config = app.Config(
+            source="/var/lib/pterodactyl/with-a-long-server-path",
+            repository="s3:https://storage.example.net/game-backups/node-production",
+        )
         with patch.object(app, "load_config", return_value=config), \
              patch.object(app.StateStore, "read", return_value={
                  "status": "success", "last_success": "2026-01-01T00:00:00+00:00",
                  "next_run": "2026-01-02T00:00:00+00:00",
+                 "storage_bytes": 1024 ** 3,
+                 "storage_repository": config.repository,
+                 "storage_checked_at": "2026-01-02T00:00:00+00:00",
              }), \
+             patch.object(app, "_maybe_refresh_storage", return_value=None), \
              patch.object(app.curses, "curs_set"), \
              patch.object(app.curses, "start_color"), \
              patch.object(app.curses, "use_default_colors"), \
@@ -252,6 +261,97 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("QUICK ACTIONS", output)
         self.assertIn("ACTIVITY", output)
         self.assertIn(app.WATERMARK, output)
+        joined_output = "".join(screen.rendered).replace(" ", "")
+        self.assertIn(config.source, joined_output)
+        self.assertIn(config.repository, joined_output)
+        self.assertIn("1.0 GiB used", output)
+        self.assertNotIn("quota unknown", output)
+
+    def test_quitting_dashboard_does_not_cancel_persistent_backup(self):
+        class FakeScreen:
+            @staticmethod
+            def erase():
+                pass
+
+            @staticmethod
+            def getmaxyx():
+                return 30, 100
+
+            @staticmethod
+            def addstr(*_args):
+                pass
+
+            @staticmethod
+            def refresh():
+                pass
+
+            @staticmethod
+            def timeout(_value):
+                pass
+
+            @staticmethod
+            def getch():
+                return ord("q")
+
+        state = {
+            "status": "running",
+            "task_status": "running",
+            "operation": "Preparing backup",
+        }
+        with patch.object(app, "load_config", return_value=app.Config(repository="/tmp/repo")), \
+             patch.object(app.StateStore, "read", return_value=state), \
+             patch.object(app.StateStore, "update") as update, \
+             patch.object(app, "_maybe_refresh_storage", return_value=None), \
+             patch.object(app.curses, "curs_set"), \
+             patch.object(app.curses, "start_color"), \
+             patch.object(app.curses, "use_default_colors"), \
+             patch.object(app.curses, "init_pair"), \
+             patch.object(app.curses, "color_pair", return_value=0):
+            app._tui(FakeScreen())
+        update.assert_not_called()
+
+    def test_s3_storage_usage_sums_object_sizes_under_repository_prefix(self):
+        client = Mock()
+        paginator = Mock()
+        paginator.paginate.return_value = [
+            {"Contents": [{"Size": 100}, {"Size": 250}]},
+            {"Contents": [{"Size": 75}]},
+        ]
+        client.get_paginator.return_value = paginator
+        session = Mock()
+        session.client.return_value = client
+
+        fake_boto3 = types.ModuleType("boto3")
+        fake_boto3.Session = Mock(return_value=session)
+        fake_botocore = types.ModuleType("botocore")
+        fake_botocore.__path__ = []
+        fake_config = types.ModuleType("botocore.config")
+        fake_config.Config = lambda **kwargs: kwargs
+        fake_exceptions = types.ModuleType("botocore.exceptions")
+        fake_exceptions.BotoCoreError = type("BotoCoreError", (Exception,), {})
+        fake_exceptions.ClientError = type("ClientError", (Exception,), {})
+        config = app.Config(
+            repository="s3:https://storage.example.net/backups/game-node",
+            access_key="access",
+            secret_key="secret",
+            region="eu-central-1",
+        )
+        with patch.dict(sys.modules, {
+            "boto3": fake_boto3,
+            "botocore": fake_botocore,
+            "botocore.config": fake_config,
+            "botocore.exceptions": fake_exceptions,
+        }):
+            used = app.s3_repository_storage_bytes(config)
+
+        self.assertEqual(used, 425)
+        client.get_paginator.assert_called_once_with("list_objects_v2")
+        paginator.paginate.assert_called_once_with(Bucket="backups", Prefix="game-node/")
+        session.client.assert_called_once_with(
+            "s3",
+            endpoint_url="https://storage.example.net",
+            config={"s3": {"addressing_style": "path"}},
+        )
 
     def test_config_is_atomically_written_with_private_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -789,6 +889,34 @@ class ResticCommandTests(unittest.TestCase):
         self.assertIn(app.LOCK_RETRY_INTERVAL, retry_command)
         self.assertIn("backup", retry_command)
 
+    def test_manual_backup_uses_transient_systemd_service(self):
+        completed = subprocess.CompletedProcess([], 0, "Running as unit: restic-node-backup-manual-1.service\n")
+        with patch.object(app.shutil, "which", return_value="/usr/bin/systemd-run"), \
+             patch.object(app.subprocess, "run", return_value=completed) as run:
+            message = app._start_manual_backup()
+        command = run.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/systemd-run")
+        self.assertIn("--system", command)
+        self.assertIn("--no-block", command)
+        self.assertIn("--collect", command)
+        self.assertIn("--property=Type=exec", command)
+        self.assertIn("--property=StateDirectory=restic-node-backup", command)
+        self.assertIn("--property=ProtectSystem=full", command)
+        self.assertEqual(command[-1], "run-now")
+        self.assertIn("continue if you close the dashboard", message)
+
+    def test_manual_backup_reports_missing_systemd_run(self):
+        with patch.object(app.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(app.AppError, "systemd-run is required"):
+                app._start_manual_backup()
+
+    def test_manual_backup_reports_systemd_start_failure(self):
+        failed = subprocess.CompletedProcess([], 1, "Access denied")
+        with patch.object(app.shutil, "which", return_value="/usr/bin/systemd-run"), \
+             patch.object(app.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(app.AppError, "Access denied"):
+                app._start_manual_backup()
+
     def test_restic_command_can_be_cancelled(self):
         config = app.Config(repository="/tmp/repo", password="pw")
         control = app.TaskControl()
@@ -984,6 +1112,18 @@ class ResticCommandTests(unittest.TestCase):
         with patch.object(app, "run_tui") as run_tui:
             self.assertEqual(app.main(["backup"]), 0)
         run_tui.assert_called_once()
+
+    def test_run_cli_starts_persistent_backup_service(self):
+        with patch.object(app, "_start_manual_backup", return_value="started") as start, \
+             patch("builtins.print") as print_output:
+            self.assertEqual(app.main(["run"]), 0)
+        start.assert_called_once()
+        print_output.assert_called_once_with("started")
+
+    def test_run_now_cli_executes_backup(self):
+        with patch.object(app, "run_backup", return_value=True) as run_backup:
+            self.assertEqual(app.main(["run-now"]), 0)
+        run_backup.assert_called_once_with()
 
     def test_ensure_repository_does_not_initialize_on_authentication_failure(self):
         config = app.Config(repository="/tmp/repo", password="pw")

@@ -16,6 +16,19 @@ dashboard; and runs a persistent scheduler under systemd. The default source is
   and should only be used when that exposure is acceptable.
 - Periodic backups with persistent schedule state, immediate catch-up after
   downtime, and exponential retry (1 minute up to 1 hour) after failures.
+- Dashboard-triggered manual backups run as transient systemd services, so
+  they continue if the terminal disconnects or the dashboard closes. The
+  `rybernt run` command uses the same persistent mechanism. Quitting the
+  dashboard never cancels a running backup; use the dashboard's **K** action
+  to request cancellation explicitly.
+- The dashboard automatically totals the current S3 objects under the
+  configured repository prefix, refreshing in the background every 30 minutes.
+  It reports used bytes; S3 has no standard bucket-capacity/free-space endpoint.
+  This is object usage, not a provider billing total; noncurrent object
+  versions are not included. The configured S3 identity needs `ListBucket`
+  permission for the repository bucket/prefix for this figure to be available.
+- Long source paths and repository URLs wrap in the NODE panel instead of
+  being clipped.
 - A local process lock prevents two instances on this node from backing up at
   once. On recognized Restic lock errors, the app invokes ordinary `restic
   unlock` to clear only locks Restic confirms are stale, then retries with

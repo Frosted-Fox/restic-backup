@@ -19,30 +19,34 @@ if [ ! -d /run/systemd/system ] || ! command -v systemctl >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1 || ! command -v restic >/dev/null 2>&1; then
-    echo "Installing Python 3 and Restic using this system's package manager..."
+if ! command -v python3 >/dev/null 2>&1 ||
+   ! command -v restic >/dev/null 2>&1 ||
+   ! python3 -c 'import boto3' >/dev/null 2>&1; then
+    echo "Installing Python 3, Restic, and boto3 using this system's package manager..."
     if command -v apt-get >/dev/null 2>&1; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update
-        apt-get install -y python3 restic
+        apt-get install -y python3 restic python3-boto3
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y python3 restic
+        dnf install -y python3 restic python3-boto3
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y python3 restic
+        yum install -y python3 restic python3-boto3
     elif command -v zypper >/dev/null 2>&1; then
-        zypper --non-interactive install python3 restic
+        zypper --non-interactive install python3 restic python3-boto3
     elif command -v pacman >/dev/null 2>&1; then
-        pacman --noconfirm --needed -S python restic
+        pacman --noconfirm --needed -S python python-boto3 restic
     elif command -v apk >/dev/null 2>&1; then
-        apk add python3 restic
+        apk add python3 py3-boto3 restic
     else
         echo "No supported package manager found. Install Python 3 and Restic, then run this installer again." >&2
         exit 1
     fi
 fi
 
-if ! command -v python3 >/dev/null 2>&1 || ! command -v restic >/dev/null 2>&1; then
-    echo "Python 3 or Restic is still unavailable after package installation." >&2
+if ! command -v python3 >/dev/null 2>&1 ||
+   ! command -v restic >/dev/null 2>&1 ||
+   ! python3 -c 'import boto3' >/dev/null 2>&1; then
+    echo "Python 3, Restic, or boto3 is still unavailable after package installation." >&2
     exit 1
 fi
 
