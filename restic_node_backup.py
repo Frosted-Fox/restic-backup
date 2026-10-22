@@ -40,6 +40,11 @@ STATE_PATH = STATE_DIR / "state.json"
 LOCK_PATH = STATE_DIR / "backup.lock"
 LOG_PATH = STATE_DIR / "backup.log"
 DEFAULT_SOURCE = "/var/lib/pterodactyl"
+PTERODACTYL_VOLUMES = Path("/var/lib/pterodactyl/volumes")
+SERVER_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 LOCK_ERRORS = (
     "repository is already locked",
     "repository is locked exclusively",
@@ -846,6 +851,55 @@ def restic_snapshots(control: TaskControl | None = None) -> list[dict[str, Any]]
     return snapshots
 
 
+def _server_volume_path(server_uuid: str) -> Path:
+    if not SERVER_UUID_PATTERN.fullmatch(server_uuid):
+        raise AppError("Enter a valid server UUID, for example 2d976043-3b60-40cb-915b-bfae65896c91.")
+    return PTERODACTYL_VOLUMES / server_uuid.lower()
+
+
+def find_server_snapshots(
+    server_uuid: str,
+    control: TaskControl | None = None,
+) -> list[dict[str, Any]]:
+    volume_path = _server_volume_path(server_uuid)
+    config = load_config()
+    result = _run_restic(
+        config,
+        ["find", "--json", server_uuid.lower()],
+        create_logger(),
+        control=control,
+    )
+    try:
+        matches = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise AppError(f"Restic returned invalid search results: {exc}") from exc
+    if not isinstance(matches, list) or any(not isinstance(match, dict) for match in matches):
+        raise AppError("Restic returned server search results in an unexpected format.")
+
+    matching_ids: set[str] = set()
+    for result_group in matches:
+        snapshot_id = result_group.get("snapshot")
+        entries = result_group.get("matches")
+        if not isinstance(snapshot_id, str) or not isinstance(entries, list):
+            raise AppError("Restic returned a server search result in an unexpected format.")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise AppError("Restic returned a server search match in an unexpected format.")
+            path = entry.get("path")
+            if isinstance(path, str) and (
+                path == str(volume_path) or path.startswith(f"{volume_path}/")
+            ):
+                matching_ids.add(snapshot_id)
+                break
+
+    snapshots = restic_snapshots(control)
+    return [
+        snapshot
+        for snapshot in snapshots
+        if isinstance(snapshot.get("id"), str) and snapshot["id"] in matching_ids
+    ]
+
+
 def _restic_command(
     config: Config,
     arguments: list[str],
@@ -891,6 +945,24 @@ def restore_snapshot(
         control=control,
     )
     return f"Restored snapshot {snapshot_id} into {target_path}."
+
+
+def restore_server_snapshot(
+    snapshot_id: str,
+    server_uuid: str,
+    control: TaskControl | None = None,
+) -> str:
+    volume_path = _server_volume_path(server_uuid)
+    if not re.fullmatch(r"[0-9a-fA-F]{4,64}", snapshot_id):
+        raise AppError("Snapshot must be a hexadecimal Restic snapshot ID.")
+    config = load_config()
+    _run_restic(
+        config,
+        ["restore", snapshot_id, "--target", "/", "--include", str(volume_path)],
+        create_logger(),
+        control=control,
+    )
+    return f"Restored server {volume_path.name} from snapshot {snapshot_id} into {volume_path}."
 
 
 def _validate_restore_target(target: str, config: Config) -> Path:
@@ -1408,6 +1480,47 @@ def _confirm_restore(screen: Any, snapshot_id: str, target: Path, create_target:
         )
 
 
+def _prompt_server_uuid(screen: Any) -> str | None:
+    default = ""
+    while True:
+        try:
+            entered = _tui_prompt(
+                screen,
+                "Server UUID to search (Esc cancels)",
+                default,
+            )
+        except AppError:
+            return None
+        try:
+            _server_volume_path(entered)
+        except AppError as exc:
+            _show_output(screen, f"Server UUID not accepted.\n\n{exc}\n\nEnter a UUID to try again.")
+            default = entered
+            continue
+        return entered.lower()
+
+
+def _confirm_server_restore(screen: Any, snapshot_id: str, server_uuid: str) -> bool:
+    volume_path = _server_volume_path(server_uuid)
+    required = f"RESTORE {volume_path.name}"
+    while True:
+        try:
+            entered = _tui_prompt(
+                screen,
+                f"Type {required} to overwrite {volume_path} from snapshot {snapshot_id[:12]}",
+                "",
+            )
+        except AppError:
+            return False
+        if entered == required:
+            return True
+        _show_output(
+            screen,
+            f"Confirmation did not match. Type {required} exactly to overwrite this server "
+            "volume, or press Esc to cancel.",
+        )
+
+
 def _timezone_picker(screen: Any, current: str) -> str:
     options = _timezone_options()
     query = ""
@@ -1628,6 +1741,7 @@ def _do_tui_action(
     control: TaskControl,
     snapshot_id: str = "",
     target: str = "",
+    server_uuid: str = "",
 ) -> None:
     task_status = "success"
     task_error: str | None = None
@@ -1647,6 +1761,12 @@ def _do_tui_action(
             result_queue.put(("message", verify_repository(control=control)))
         elif action in ("snapshots", "select_restore"):
             result_queue.put(("snapshots", restic_snapshots(control), action))
+        elif action == "select_server_restore":
+            result_queue.put((
+                "server_snapshots",
+                find_server_snapshots(server_uuid, control),
+                server_uuid,
+            ))
         elif action == "prune":
             result_queue.put(("message", prune_repository(control)))
         elif action == "init":
@@ -1654,6 +1774,11 @@ def _do_tui_action(
             result_queue.put(("message", initialize_repository(control)))
         elif action == "restore":
             result_queue.put(("message", restore_snapshot(snapshot_id, target, control)))
+        elif action == "restore_server":
+            result_queue.put((
+                "message",
+                restore_server_snapshot(snapshot_id, server_uuid, control),
+            ))
     except TaskCancelled as exc:
         task_status = "cancelled"
         task_error = str(exc)
@@ -1743,6 +1868,7 @@ def _snapshot_browser(
     *,
     allow_restore: bool,
     timezone_name: str = "UTC",
+    heading: str = "SNAPSHOTS",
 ) -> tuple[dict[str, Any], str] | None:
     snapshots = sorted(snapshots, key=lambda snapshot: snapshot.get("time", ""), reverse=True)
     if not snapshots:
@@ -1756,7 +1882,8 @@ def _snapshot_browser(
         visible = max(1, height - 7)
         offset = min(offset, max(0, len(snapshots) - visible))
         screen.addstr(
-            0, 2, f" SNAPSHOTS · {len(snapshots)} total · {timezone_name} ", curses.A_BOLD
+            0, 2, f" {heading} · {len(snapshots)} total · {timezone_name} "[: width - 4],
+            curses.A_BOLD,
         )
         instruction = "Enter details · r restore" if allow_restore else "Enter details"
         screen.addstr(1, 2, f"↑/↓ or j/k · PgUp/PgDn · {instruction} · q close")
@@ -2089,6 +2216,7 @@ def _tui(screen: Any) -> None:
         actions = [
             ("r", "Run backup"), ("v", "Verify repo"),
             ("s", "Snapshots"), ("x", "Restore"),
+            ("u", "Restore server"),
             ("p", "Retention"), ("i", "Initialize"),
             ("c", "Configure"), ("k", "Cancel task"),
             ("l", "Activity log"), ("q", "Quit"),
@@ -2133,7 +2261,7 @@ def _tui(screen: Any) -> None:
         for index, line in enumerate(recent, start=activity_top + 1):
             _ui_put(screen, index, 4, _localized_log_line(line, timezone_name), width - 8)
         _ui_put(screen, height - 2, 2, notice, width - 4, curses.A_BOLD)
-        _ui_footer(screen, "R backup · S snapshots · X restore · C configure · L logs · Q quit")
+        _ui_footer(screen, "R backup · S snapshots · X restore · U server restore · C configure · Q quit")
         screen.refresh()
         key = screen.getch()
         if key in (ord("q"), ord("Q")):
@@ -2175,6 +2303,7 @@ def _tui(screen: Any) -> None:
         elif key in (
             ord("r"), ord("R"), ord("v"), ord("V"), ord("s"), ord("S"),
             ord("p"), ord("P"), ord("i"), ord("I"), ord("x"), ord("X"),
+            ord("u"), ord("U"),
         ):
             if worker is not None or task_running:
                 notice = "Wait for the current task to finish."
@@ -2187,6 +2316,8 @@ def _tui(screen: Any) -> None:
                 action = "snapshots"
             elif key in (ord("x"), ord("X")):
                 action = "select_restore"
+            elif key in (ord("u"), ord("U")):
+                action = "select_server_restore"
             elif key in (ord("p"), ord("P")):
                 action = "prune"
             elif key in (ord("i"), ord("I")):
@@ -2195,6 +2326,12 @@ def _tui(screen: Any) -> None:
                 notice = "Configure the application first (press c)."
                 continue
             action_args: tuple[str, ...] = ()
+            if action == "select_server_restore":
+                server_uuid = _prompt_server_uuid(screen)
+                if server_uuid is None:
+                    notice = "Server restore cancelled."
+                    continue
+                action_args = ("", "", server_uuid)
             if action == "prune":
                 try:
                     confirmation = _tui_prompt(screen, "Type PRUNE to apply retention", "")
@@ -2217,13 +2354,19 @@ def _tui(screen: Any) -> None:
             worker = None
             active_action = None
             result_type, result = result_item[:2]
-            if result_type == "snapshots":
-                action = result_item[2]
+            if result_type in ("snapshots", "server_snapshots"):
+                action = result_item[2] if result_type == "snapshots" else "select_server_restore"
+                server_uuid = result_item[2] if result_type == "server_snapshots" else ""
                 selected = _snapshot_browser(
                     screen,
                     result,
                     allow_restore=True,
                     timezone_name=config.timezone_name if config else "UTC",
+                    heading=(
+                        f"SERVER BACKUPS · {server_uuid}"
+                        if server_uuid
+                        else "SNAPSHOTS"
+                    ),
                 )
                 if selected is None:
                     notice = "Snapshot selection cancelled."
@@ -2234,6 +2377,27 @@ def _tui(screen: Any) -> None:
                         worker = None
                         continue
                     snapshot_id = str(selected.get("id", ""))
+                    if action == "select_server_restore":
+                        if not _confirm_server_restore(screen, snapshot_id, server_uuid):
+                            notice = "Server restore cancelled."
+                            worker = None
+                            continue
+                        active_control = TaskControl()
+                        worker = threading.Thread(
+                            target=_do_tui_action,
+                            args=(
+                                "restore_server",
+                                result_queue,
+                                active_control,
+                                snapshot_id,
+                                "",
+                                server_uuid,
+                            ),
+                        )
+                        active_action = "restore_server"
+                        notice = f"Restoring server {server_uuid}…"
+                        worker.start()
+                        continue
                     restore_target = _prompt_restore_target(
                         screen, "/srv/restore", config
                     ) if config else None

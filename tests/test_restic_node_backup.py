@@ -630,6 +630,81 @@ class ResticCommandTests(unittest.TestCase):
                 ["restore", "a" * 64, "--target", str(target)],
             )
 
+    def test_server_uuid_must_be_a_canonical_uuid(self):
+        with self.assertRaisesRegex(app.AppError, "valid server UUID"):
+            app._server_volume_path("../../etc")
+        self.assertEqual(
+            app._server_volume_path("2D976043-3B60-40CB-915B-BFAE65896C91"),
+            Path("/var/lib/pterodactyl/volumes/2d976043-3b60-40cb-915b-bfae65896c91"),
+        )
+
+    def test_find_server_snapshots_returns_only_exact_volume_matches(self):
+        server_uuid = "2d976043-3b60-40cb-915b-bfae65896c91"
+        matching_id = "a" * 64
+        snapshots = [
+            {"id": matching_id, "time": "2026-01-02T00:00:00Z"},
+            {"id": "b" * 64, "time": "2026-01-01T00:00:00Z"},
+        ]
+        results = [
+            {
+                "matches": [{
+                    "path": f"/var/lib/pterodactyl/volumes/{server_uuid}/world",
+                }],
+                "hits": 1,
+                "snapshot": matching_id,
+            },
+            {
+                "matches": [{
+                    "path": f"/var/lib/pterodactyl/volumes/{server_uuid}-old/world",
+                }],
+                "hits": 1,
+                "snapshot": "b" * 64,
+            },
+        ]
+        config = app.Config(repository="/tmp/repo")
+        with patch.object(app, "load_config", return_value=config), \
+             patch.object(app, "create_logger", return_value=app.logging.getLogger("test-server-find")), \
+             patch.object(app, "_run_restic", side_effect=[
+                 subprocess.CompletedProcess([], 0, json.dumps(results)),
+                 subprocess.CompletedProcess([], 0, json.dumps(snapshots)),
+             ]) as restic:
+            found = app.find_server_snapshots(server_uuid)
+        self.assertEqual(found, snapshots[:1])
+        self.assertEqual(restic.call_args_list[0].args[1], ["find", "--json", server_uuid])
+        self.assertEqual(restic.call_args_list[1].args[1], ["snapshots", "--json"])
+
+    def test_restore_server_snapshot_includes_only_requested_volume(self):
+        server_uuid = "2d976043-3b60-40cb-915b-bfae65896c91"
+        config = app.Config(repository="/tmp/repo")
+        with patch.object(app, "load_config", return_value=config), \
+             patch.object(app, "create_logger", return_value=app.logging.getLogger("test-server-restore")), \
+             patch.object(app, "_run_restic") as restic:
+            message = app.restore_server_snapshot("a" * 64, server_uuid)
+        self.assertEqual(
+            restic.call_args.args[1],
+            [
+                "restore",
+                "a" * 64,
+                "--target",
+                "/",
+                "--include",
+                f"/var/lib/pterodactyl/volumes/{server_uuid}",
+            ],
+        )
+        self.assertIn(f"/var/lib/pterodactyl/volumes/{server_uuid}", message)
+
+    def test_server_restore_requires_uuid_confirmation(self):
+        server_uuid = "2d976043-3b60-40cb-915b-bfae65896c91"
+        with patch.object(app, "_tui_prompt", side_effect=["RESTORE", f"RESTORE {server_uuid}"]) as prompt, \
+             patch.object(app, "_show_output") as show_error:
+            confirmed = app._confirm_server_restore(
+                object(), "a" * 64, server_uuid
+            )
+        self.assertTrue(confirmed)
+        self.assertEqual(prompt.call_count, 2)
+        show_error.assert_called_once()
+        self.assertIn(server_uuid, prompt.call_args.args[1])
+
     def test_activity_log_viewer_can_scroll_to_old_entries(self):
         class FakeScreen:
             def __init__(self):

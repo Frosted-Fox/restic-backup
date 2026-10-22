@@ -40,6 +40,8 @@ dashboard; and runs a persistent scheduler under systemd. The default source is
 - Retain the latest configured number of this app's snapshots (tagged and
   host-scoped) and prune unused repository data after a successful backup.
 - Snapshot listing, repository verification, and restore to a separate path.
+- Search snapshots for a Pterodactyl server UUID and restore only that server's
+  volume to its original `/var/lib/pterodactyl/volumes/<UUID>` path.
 - Rotating local activity log and systemd journal output.
 
 ## Install and configure
@@ -132,9 +134,10 @@ the footer watermark “Made by Ariyan Kumar | Rybernt”.
 
 Keyboard controls: `r` run a backup, `s` browse all snapshots and inspect
 details, `x` select a snapshot and restore it after confirming a separate
-target directory, `v` verify repository indexes and packs, `i` initialize the
-configured repository, `p` apply retention/prune (with an explicit
-confirmation), `k` cancel a running task, `l` open the scrollable activity log,
+target directory, `u` search snapshots by server UUID and restore only the
+matching volume to its original path, `v` verify repository indexes and packs,
+`i` initialize the configured repository, `p` apply retention/prune (with an
+explicit confirmation), `k` cancel a running task, `l` open the scrollable activity log,
 `c` configure, and `q` quit. The dashboard displays live Restic progress when
 available, current files, task status, and a few recent log entries. Restic's
 high-frequency progress events are omitted from the log, and task output is
@@ -159,10 +162,15 @@ directory must already exist and be writable. A missing final directory
 requires typing `CREATE`, while restoring into an existing directory requires
 typing `RESTORE`. Invalid paths and mistyped confirmations show a specific
 error and let you retry; restores that overlap the configured live source are
-rejected. In a text prompt, use Ctrl+U to clear the current value, or use
-Backspace and the arrow keys to edit it. The `s` browser and `x` restore
-shortcut both support this flow. Restoring to `/` is allowed but can overwrite
-live files; it requires typing `RESTORE TO /` as an additional safeguard.
+rejected. For a server restore, enter the server UUID (for example
+`2d976043-3b60-40cb-915b-bfae65896c91`). The dashboard searches backup contents
+and lists only snapshots containing that server volume. Select a snapshot and
+press `r` to restore it; type `RESTORE <UUID>` to confirm overwriting only
+`/var/lib/pterodactyl/volumes/<UUID>`. In a text prompt, use Ctrl+U to clear
+the current value, or use Backspace and the arrow keys to edit it. The `s`
+browser and `x` restore shortcut both support this flow. Restoring to `/` is
+allowed but can overwrite live files; it requires typing `RESTORE TO /` as an
+additional safeguard.
 For full data verification (slower and more bandwidth-intensive), use:
 
 ```sh
