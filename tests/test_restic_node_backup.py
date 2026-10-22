@@ -675,13 +675,27 @@ class ResticCommandTests(unittest.TestCase):
 
     def test_restore_server_snapshot_includes_only_requested_volume(self):
         server_uuid = "2d976043-3b60-40cb-915b-bfae65896c91"
+        find_result = [{
+            "matches": [{
+                "path": f"/var/lib/pterodactyl/volumes/{server_uuid}/world",
+            }],
+            "hits": 1,
+            "snapshot": "a" * 64,
+        }]
         config = app.Config(repository="/tmp/repo")
         with patch.object(app, "load_config", return_value=config), \
              patch.object(app, "create_logger", return_value=app.logging.getLogger("test-server-restore")), \
-             patch.object(app, "_run_restic") as restic:
+             patch.object(app, "_run_restic", side_effect=[
+                 subprocess.CompletedProcess([], 0, json.dumps(find_result)),
+                 subprocess.CompletedProcess([], 0, ""),
+             ]) as restic:
             message = app.restore_server_snapshot("a" * 64, server_uuid)
         self.assertEqual(
-            restic.call_args.args[1],
+            restic.call_args_list[0].args[1],
+            ["find", "--json", "--snapshot", "a" * 64, server_uuid],
+        )
+        self.assertEqual(
+            restic.call_args_list[1].args[1],
             [
                 "restore",
                 "a" * 64,
@@ -692,6 +706,27 @@ class ResticCommandTests(unittest.TestCase):
             ],
         )
         self.assertIn(f"/var/lib/pterodactyl/volumes/{server_uuid}", message)
+
+    def test_restore_server_snapshot_rejects_snapshot_without_requested_volume(self):
+        server_uuid = "2d976043-3b60-40cb-915b-bfae65896c91"
+        unrelated = [{
+            "matches": [{
+                "path": f"/var/lib/pterodactyl/volumes/{server_uuid}-other",
+            }],
+            "hits": 1,
+            "snapshot": "a" * 64,
+        }]
+        config = app.Config(repository="/tmp/repo")
+        with patch.object(app, "load_config", return_value=config), \
+             patch.object(app, "create_logger", return_value=app.logging.getLogger("test-server-restore-missing")), \
+             patch.object(
+                 app,
+                 "_run_restic",
+                 return_value=subprocess.CompletedProcess([], 0, json.dumps(unrelated)),
+             ) as restic:
+            with self.assertRaisesRegex(app.AppError, "does not contain server volume"):
+                app.restore_server_snapshot("a" * 64, server_uuid)
+        restic.assert_called_once()
 
     def test_server_restore_requires_uuid_confirmation(self):
         server_uuid = "2d976043-3b60-40cb-915b-bfae65896c91"
@@ -1091,6 +1126,37 @@ class ResticCommandTests(unittest.TestCase):
             "2026-01-02 05:30:00 IST",
         )
 
+    def test_snapshot_browser_offers_server_only_restore(self):
+        class FakeScreen:
+            def __init__(self):
+                self.keys = iter([ord("u")])
+                self.rendered = []
+
+            @staticmethod
+            def erase():
+                pass
+
+            @staticmethod
+            def getmaxyx():
+                return 30, 120
+
+            def addstr(self, _row, _column, text, *_args):
+                self.rendered.append(str(text))
+
+            @staticmethod
+            def refresh():
+                pass
+
+            def getch(self):
+                return next(self.keys)
+
+        snapshots = [{"id": "a" * 64, "time": "2026-01-02T00:00:00Z"}]
+        with patch.object(app.curses, "color_pair", return_value=0):
+            screen = FakeScreen()
+            result = app._snapshot_browser(screen, snapshots, allow_restore=True)
+        self.assertEqual(result, (snapshots[0], "restore_server"))
+        self.assertTrue(any("u server only" in line for line in screen.rendered))
+
     def test_snapshot_details_can_return_selected_restore_action(self):
         class FakeScreen:
             def __init__(self):
@@ -1127,6 +1193,36 @@ class ResticCommandTests(unittest.TestCase):
             result = app._snapshot_browser(screen, snapshots, allow_restore=True)
         self.assertEqual(result, (snapshots[0], "restore"))
         self.assertTrue(any("Files: 10 processed" in line for line in screen.rendered))
+
+    def test_snapshot_details_offers_server_only_restore(self):
+        class FakeScreen:
+            def __init__(self):
+                self.keys = iter([10, ord("u")])
+                self.rendered = []
+
+            @staticmethod
+            def erase():
+                pass
+
+            @staticmethod
+            def getmaxyx():
+                return 24, 100
+
+            def addstr(self, _row, _column, text, *_args):
+                self.rendered.append(str(text))
+
+            @staticmethod
+            def refresh():
+                pass
+
+            def getch(self):
+                return next(self.keys)
+
+        screen = FakeScreen()
+        snapshot = {"id": "a" * 64, "time": "2026-01-02T00:00:00Z"}
+        with patch.object(app.curses, "color_pair", return_value=0):
+            result = app._snapshot_browser(screen, [snapshot], allow_restore=True)
+        self.assertEqual(result, (snapshot, "restore_server"))
 
     def test_snapshot_browser_cancel_returns_no_selection(self):
         class FakeScreen:

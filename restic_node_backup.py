@@ -956,6 +956,38 @@ def restore_server_snapshot(
     if not re.fullmatch(r"[0-9a-fA-F]{4,64}", snapshot_id):
         raise AppError("Snapshot must be a hexadecimal Restic snapshot ID.")
     config = load_config()
+    search = _run_restic(
+        config,
+        ["find", "--json", "--snapshot", snapshot_id, volume_path.name],
+        create_logger(),
+        control=control,
+    )
+    try:
+        matches = json.loads(search.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise AppError(f"Restic returned invalid server search results: {exc}") from exc
+    if not isinstance(matches, list) or any(not isinstance(match, dict) for match in matches):
+        raise AppError("Restic returned server search results in an unexpected format.")
+    snapshot_has_server = False
+    for result_group in matches:
+        entries = result_group.get("matches")
+        if not isinstance(entries, list):
+            raise AppError("Restic returned a server search result in an unexpected format.")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise AppError("Restic returned a server search match in an unexpected format.")
+            path = entry.get("path")
+            if isinstance(path, str) and (
+                path == str(volume_path) or path.startswith(f"{volume_path}/")
+            ):
+                snapshot_has_server = True
+                break
+        if snapshot_has_server:
+            break
+    if not snapshot_has_server:
+        raise AppError(
+            f"Snapshot {snapshot_id} does not contain server volume {volume_path}."
+        )
     _run_restic(
         config,
         ["restore", snapshot_id, "--target", "/", "--include", str(volume_path)],
@@ -1869,6 +1901,7 @@ def _snapshot_browser(
     allow_restore: bool,
     timezone_name: str = "UTC",
     heading: str = "SNAPSHOTS",
+    server_uuid: str = "",
 ) -> tuple[dict[str, Any], str] | None:
     snapshots = sorted(snapshots, key=lambda snapshot: snapshot.get("time", ""), reverse=True)
     if not snapshots:
@@ -1885,7 +1918,13 @@ def _snapshot_browser(
             0, 2, f" {heading} · {len(snapshots)} total · {timezone_name} "[: width - 4],
             curses.A_BOLD,
         )
-        instruction = "Enter details · r restore" if allow_restore else "Enter details"
+        instruction = (
+            "Enter details · r server restore"
+            if server_uuid
+            else "Enter details · r restore · u server only"
+            if allow_restore
+            else "Enter details"
+        )
         screen.addstr(1, 2, f"↑/↓ or j/k · PgUp/PgDn · {instruction} · q close")
         for row, snapshot_index in enumerate(range(offset, min(len(snapshots), offset + visible)), start=3):
             snapshot = snapshots[snapshot_index]
@@ -1900,7 +1939,14 @@ def _snapshot_browser(
         snapshot = snapshots[selected]
         screen.addstr(height - 3, 2, f"Selected: {snapshot.get('id', 'unknown')}"[: width - 4])
         screen.addstr(height - 2, 2, f"{selected + 1} / {len(snapshots)}")
-        _ui_footer(screen, "Enter details · r restore · q close")
+        footer = (
+            "Enter details · r server restore · q close"
+            if server_uuid
+            else "Enter details · r restore · u server only · q close"
+            if allow_restore
+            else "Enter details · q close"
+        )
+        _ui_footer(screen, footer)
         screen.refresh()
         key = screen.getch()
         if key in (ord("q"), ord("Q"), 27):
@@ -1914,10 +1960,19 @@ def _snapshot_browser(
         elif key == curses.KEY_NPAGE:
             selected = min(len(snapshots) - 1, selected + visible)
         elif key in (10, 13, curses.KEY_ENTER, ord("d"), ord("D")):
-            if _snapshot_details(screen, snapshots[selected], timezone_name, allow_restore):
-                return snapshots[selected], "restore"
+            detail_action = _snapshot_details(
+                screen,
+                snapshots[selected],
+                timezone_name,
+                allow_restore,
+                server_only=bool(server_uuid),
+            )
+            if detail_action is not None:
+                return snapshots[selected], detail_action
         elif allow_restore and key in (ord("r"), ord("R")):
-            return snapshots[selected], "restore"
+            return snapshots[selected], "restore_server" if server_uuid else "restore"
+        elif allow_restore and not server_uuid and key in (ord("u"), ord("U")):
+            return snapshots[selected], "restore_server"
         if selected < offset:
             offset = selected
         elif selected >= offset + visible:
@@ -1929,7 +1984,9 @@ def _snapshot_details(
     snapshot: dict[str, Any],
     timezone_name: str,
     allow_restore: bool,
-) -> bool:
+    *,
+    server_only: bool = False,
+) -> str | None:
     scalar_fields = (
         ("Snapshot ID", snapshot.get("id")),
         ("Short ID", snapshot.get("short_id")),
@@ -1963,14 +2020,22 @@ def _snapshot_details(
         screen.addstr(0, 2, " SNAPSHOT DETAILS ", curses.A_BOLD)
         for row, line in enumerate(lines[offset:offset + page_size], start=2):
             screen.addstr(row, 2, line[:max(1, width - 4)])
-        footer = "r restore · ↑/↓ scroll · q back" if allow_restore else "↑/↓ scroll · q back"
+        footer = (
+            "r server restore · ↑/↓ scroll · q back"
+            if allow_restore and server_only
+            else "r restore · u server only · ↑/↓ scroll · q back"
+            if allow_restore
+            else "↑/↓ scroll · q back"
+        )
         _ui_footer(screen, footer)
         screen.refresh()
         key = screen.getch()
         if key in (ord("q"), ord("Q"), 27):
-            return False
+            return None
         if allow_restore and key in (ord("r"), ord("R")):
-            return True
+            return "restore_server" if server_only else "restore"
+        if allow_restore and not server_only and key in (ord("u"), ord("U")):
+            return "restore_server"
         if key in (curses.KEY_UP, ord("k")):
             offset = max(0, offset - 1)
         elif key in (curses.KEY_DOWN, ord("j")):
@@ -2367,17 +2432,25 @@ def _tui(screen: Any) -> None:
                         if server_uuid
                         else "SNAPSHOTS"
                     ),
+                    server_uuid=server_uuid,
                 )
                 if selected is None:
                     notice = "Snapshot selection cancelled."
                 else:
                     selected, selection_action = selected
                     if selection_action != "restore":
-                        notice = "Snapshot selected."
-                        worker = None
-                        continue
+                        if selection_action != "restore_server":
+                            notice = "Snapshot selected."
+                            worker = None
+                            continue
                     snapshot_id = str(selected.get("id", ""))
-                    if action == "select_server_restore":
+                    if selection_action == "restore_server" or action == "select_server_restore":
+                        if not server_uuid:
+                            server_uuid = _prompt_server_uuid(screen)
+                        if server_uuid is None:
+                            notice = "Server restore cancelled."
+                            worker = None
+                            continue
                         if not _confirm_server_restore(screen, snapshot_id, server_uuid):
                             notice = "Server restore cancelled."
                             worker = None

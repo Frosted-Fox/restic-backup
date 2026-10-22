@@ -156,8 +156,11 @@ you type by country, city, or zone name and previews local time and UTC offset.
 The dashboard clock, last-success/next-run times, and log timestamps also use
 the selected zone. Use Backspace to edit the search. In the snapshot browser,
 select a snapshot and press Enter or `d` for its metadata/details; press `r` in
-the list or details screen to restore it to a separate directory after
-confirmation. Restore destinations must be absolute paths; their parent
+the list or details screen to restore the complete snapshot to a separate
+directory, or press `u` to restore only one server volume from that snapshot.
+The server-only action prompts for the UUID and restores only
+`/var/lib/pterodactyl/volumes/<UUID>` in place after UUID confirmation. Restore
+destinations for complete snapshots must be absolute paths; their parent
 directory must already exist and be writable. A missing final directory
 requires typing `CREATE`, while restoring into an existing directory requires
 typing `RESTORE`. Invalid paths and mistyped confirmations show a specific
@@ -165,7 +168,7 @@ error and let you retry; restores that overlap the configured live source are
 rejected. For a server restore, enter the server UUID (for example
 `2d976043-3b60-40cb-915b-bfae65896c91`). The dashboard searches backup contents
 and lists only snapshots containing that server volume. Select a snapshot and
-press `r` to restore it; type `RESTORE <UUID>` to confirm overwriting only
+press `r` to restore only that volume; type `RESTORE <UUID>` to confirm overwriting only
 `/var/lib/pterodactyl/volumes/<UUID>`. In a text prompt, use Ctrl+U to clear
 the current value, or use Backspace and the arrow keys to edit it. The `s`
 browser and `x` restore shortcut both support this flow. Restoring to `/` is
